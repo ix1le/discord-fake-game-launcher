@@ -518,20 +518,33 @@ fn build_details(app: &App, width: usize) -> Vec<Line<'static>> {
             .unwrap_or(p.as_path())
             .display()
             .to_string();
-        lines.push(Line::from(vec![
-            Span::styled("Dummy file", Style::new().fg(DIM)),
-            Span::styled(" · ", Style::new().fg(DIM)),
-            Span::styled("Ctrl+O", Style::new().fg(ACCENT)),
-            Span::styled(" open folder", Style::new().fg(DIM)),
-        ]));
+        let hint = |text: &str| {
+            Line::from(vec![
+                Span::styled("Ctrl+O", Style::new().fg(ACCENT)),
+                Span::styled(
+                    truncate(text, width.saturating_sub(6)),
+                    Style::new().fg(DIM),
+                ),
+            ])
+        };
+        if width >= "Dummy file · Ctrl+O open folder".chars().count() {
+            lines.push(Line::from(vec![
+                Span::styled("Dummy file", Style::new().fg(DIM)),
+                Span::styled(" · ", Style::new().fg(DIM)),
+                Span::styled("Ctrl+O", Style::new().fg(ACCENT)),
+                Span::styled(" open folder", Style::new().fg(DIM)),
+            ]));
+        } else {
+            lines.push(Line::from(Span::styled("Dummy file", Style::new().fg(DIM))));
+            lines.push(hint(" open folder"));
+        }
         for l in wrap(&shown, width) {
             lines.push(Line::from(Span::styled(l, Style::new().fg(TEXT))));
         }
         if !p.exists() {
-            lines.push(Line::from(Span::styled(
-                "(created on first launch)",
-                Style::new().fg(DIM),
-            )));
+            for l in wrap("(created on first launch)", width) {
+                lines.push(Line::from(Span::styled(l, Style::new().fg(DIM))));
+            }
         }
         lines.push(Line::raw(""));
     }
