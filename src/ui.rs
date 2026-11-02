@@ -82,11 +82,40 @@ fn fmt_num(n: usize) -> String {
     out
 }
 
-fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let left = Line::from(Span::styled(
-        "Discord Fake Game Launcher",
+fn short_version(v: &str) -> String {
+    match v.strip_suffix(".0") {
+        Some(rest) if rest.matches('.').count() == 1 => rest.to_string(),
+        _ => v.to_string(),
+    }
+}
+
+fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
+    let title = "Discord Fake Game Launcher";
+    let mut spans = vec![Span::styled(
+        title,
         Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
-    ));
+    )];
+
+    let version = short_version(concat!("v", env!("CARGO_PKG_VERSION")));
+    let title_w = title.chars().count();
+    let version_w = version.chars().count();
+    spans.push(Span::styled(format!(" {version}"), Style::new().fg(DIM)));
+
+    app.update_hit = None;
+    if let Some(u) = &app.update {
+        let label = format!("↑ {} available", short_version(&u.tag));
+        let gap = 3;
+        let label_w = label.chars().count();
+        let used = title_w + 1 + version_w;
+        if used + gap + label_w <= area.width as usize {
+            let x0 = area.x + (used + gap) as u16;
+            app.update_hit = Some((x0, x0 + label_w as u16, area.y));
+            spans.push(Span::raw(" ".repeat(gap)));
+            spans.push(Span::styled(label, Style::new().fg(YELLOW)));
+        }
+    }
+
+    let left = Line::from(spans);
     let left_w = left.width();
     f.render_widget(Paragraph::new(left), area);
 

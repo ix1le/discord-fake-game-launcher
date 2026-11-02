@@ -13,7 +13,7 @@ use ratatui::widgets::ListState;
 use crate::keys;
 use crate::launcher;
 use crate::model::{filter_indices, make_game_key, sort_library, to_db_games, DbGame, Game};
-use crate::store::{self, Paths};
+use crate::store::{self, Paths, Update};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -63,7 +63,11 @@ pub struct App {
     pub tabs_y: u16,
     pub tab_hits: Vec<(u16, u16, Tab)>,
 
+    pub update: Option<Update>,
+    pub update_hit: Option<(u16, u16, u16)>,
+
     sync_rx: Option<Receiver<Result<bool, String>>>,
+    update_rx: Option<Receiver<Option<Update>>>,
 }
 
 impl App {
@@ -96,13 +100,17 @@ impl App {
             detail_key: String::new(),
             tabs_y: 0,
             tab_hits: Vec::new(),
+            update: None,
+            update_hit: None,
             sync_rx: None,
+            update_rx: None,
         };
 
         app.refresh_library_view(None);
 
         let _ = app.reload_db();
         app.start_sync();
+        app.start_update_check();
         app
     }
 
@@ -196,7 +204,24 @@ impl App {
         self.sync_rx = Some(rx);
     }
 
+    fn start_update_check(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(store::check_update());
+        });
+        self.update_rx = Some(rx);
+    }
+
     pub fn tick(&mut self) {
+        match self.update_rx.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(found)) => {
+                self.update = found;
+                self.update_rx = None;
+            }
+            Some(Err(TryRecvError::Disconnected)) => self.update_rx = None,
+            Some(Err(TryRecvError::Empty)) | None => {}
+        }
+
         let msg = self.sync_rx.as_ref().map(|rx| rx.try_recv());
         match msg {
             Some(Ok(result)) => {
@@ -427,19 +452,30 @@ impl App {
             self.error(format!("Could not create the data folder: {}", store::io_text(&e)));
             return;
         }
+        let dir = self.paths.dir.clone();
+        self.open_target(dir.as_os_str(), "the folder");
+    }
+
+    fn open_update_page(&mut self) {
+        if let Some(u) = self.update.clone() {
+            self.open_target(std::ffi::OsStr::new(&u.url), "the release page");
+        }
+    }
+
+    fn open_target(&mut self, target: &std::ffi::OsStr, what: &str) {
         let opener = match std::env::consts::OS {
             "windows" => "explorer",
             "macos" => "open",
             _ => "xdg-open",
         };
         let result = Command::new(opener)
-            .arg(&self.paths.dir)
+            .arg(target)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn();
         if let Err(e) = result {
-            self.error(format!("Could not open the folder: {}", store::io_text(&e)));
+            self.error(format!("Could not open {what}: {}", store::io_text(&e)));
         }
     }
 
@@ -479,6 +515,12 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((x0, x1, y)) = self.update_hit {
+                    if m.row == y && m.column >= x0 && m.column < x1 {
+                        self.open_update_page();
+                        return;
+                    }
+                }
                 if m.row == self.tabs_y {
                     if let Some(&(_, _, tab)) = self
                         .tab_hits
