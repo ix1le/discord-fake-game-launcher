@@ -8,7 +8,8 @@ mod ui;
 use std::io;
 use std::time::Duration;
 
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+use ratatui::crossterm::terminal::SetTitle;
 use ratatui::DefaultTerminal;
 
 use crate::app::App;
@@ -46,7 +47,13 @@ fn main() {
     let mut app = App::new(os);
 
     let mut terminal = ratatui::init();
+    let _ = ratatui::crossterm::execute!(
+        io::stdout(),
+        EnableMouseCapture,
+        SetTitle("Discord Fake Game Launcher")
+    );
     let result = run(&mut terminal, &mut app);
+    let _ = ratatui::crossterm::execute!(io::stdout(), DisableMouseCapture);
     ratatui::restore();
 
     app.shutdown();
@@ -64,10 +71,10 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
         let wait = if app.syncing { 80 } else { 150 };
         if event::poll(Duration::from_millis(wait))? {
             loop {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        app.handle_key(key);
-                    }
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
+                    Event::Mouse(m) => app.handle_mouse(m),
+                    _ => {}
                 }
                 if app.should_quit || !event::poll(Duration::ZERO)? {
                     break;

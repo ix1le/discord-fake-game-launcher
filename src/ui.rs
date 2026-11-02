@@ -1,7 +1,10 @@
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, List, ListItem, ListState, Padding, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState,
+};
 use ratatui::Frame;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -59,6 +62,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).areas(body);
     draw_list(f, app, left);
     draw_details(f, app, right);
+    draw_list_scrollbar(f, app);
 
     if show_status {
         draw_status(f, app, status);
@@ -76,10 +80,6 @@ fn fmt_num(n: usize) -> String {
         out.push(ch);
     }
     out
-}
-
-fn base_name(exe: &str) -> &str {
-    exe.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(exe)
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -183,19 +183,23 @@ fn tab_spans(label: &str, count: usize, active: bool) -> Vec<Span<'static>> {
     }
 }
 
-fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
+fn draw_tabs(f: &mut Frame, app: &mut App, area: Rect) {
+    app.tabs_y = area.y;
+    app.tab_hits.clear();
+
+    let browse = tab_spans("Browse", app.filtered.len(), app.tab == Tab::Browse);
+    let library = tab_spans("Library", app.library.len(), app.tab == Tab::Library);
+    let browse_w = Line::from(browse.clone()).width() as u16;
+    let library_w = Line::from(library.clone()).width() as u16;
+    let x0 = area.x + 1;
+    app.tab_hits.push((x0, x0 + browse_w, Tab::Browse));
+    let x1 = x0 + browse_w + 3;
+    app.tab_hits.push((x1, x1 + library_w, Tab::Library));
+
     let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
-    spans.extend(tab_spans(
-        "Browse",
-        app.filtered.len(),
-        app.tab == Tab::Browse,
-    ));
+    spans.extend(browse);
     spans.push(Span::raw("   "));
-    spans.extend(tab_spans(
-        "Library",
-        app.library.len(),
-        app.tab == Tab::Library,
-    ));
+    spans.extend(library);
     let tabs_w = Line::from(spans.clone()).width();
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 
@@ -220,35 +224,24 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn row(
-    name: &str,
-    exe: &str,
-    mark: Span<'static>,
-    dim_name: bool,
-    avail: usize,
-) -> ListItem<'static> {
-    let name_style = Style::new().fg(if dim_name { DIM } else { TEXT });
-    let mut spans = vec![
-        Span::raw(" "),
-        Span::styled(name.to_string(), name_style),
-        mark,
-    ];
-
-    let left_w = Line::from(spans.clone()).width();
-    let exe_full = base_name(exe);
-    let exe_short: String = if exe_full.chars().count() > 26 {
-        let mut t: String = exe_full.chars().take(25).collect();
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
         t.push('…');
         t
-    } else {
-        exe_full.to_string()
-    };
-    let exe_w = exe_short.chars().count();
-    if left_w + 2 + exe_w <= avail {
-        spans.push(Span::raw(" ".repeat(avail - left_w - exe_w)));
-        spans.push(Span::styled(exe_short, Style::new().fg(DIM)));
     }
-    ListItem::new(Line::from(spans))
+}
+
+fn row(name: &str, mark: Span<'static>, dim_name: bool, avail: usize) -> ListItem<'static> {
+    let name_style = Style::new().fg(if dim_name { DIM } else { TEXT });
+    let name = truncate(name, avail.saturating_sub(1 + mark.width()).max(1));
+    ListItem::new(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(name, name_style),
+        mark,
+    ]))
 }
 
 fn empty_state(f: &mut Frame, area: Rect, lines: Vec<String>) {
@@ -290,6 +283,7 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
     let [tabs, list_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
     draw_tabs(f, app, tabs);
+    app.list_area = list_area;
 
     let avail = (list_area.width as usize).saturating_sub(1);
     let selected = Style::new().bg(SELECTED_BG).add_modifier(Modifier::BOLD);
@@ -340,7 +334,7 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
                     } else {
                         Span::raw("")
                     };
-                    row(&g.name, &g.exe, mark, g.uses_new_detection, avail)
+                    row(&g.name, mark, g.uses_new_detection, avail)
                 })
                 .collect();
 
@@ -379,7 +373,7 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
                     } else {
                         Span::raw("")
                     };
-                    row(&g.name, &g.exe, mark, false, avail)
+                    row(&g.name, mark, false, avail)
                 })
                 .collect();
 
@@ -391,103 +385,212 @@ fn draw_list(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn field(lines: &mut Vec<Line<'static>>, label: &str, value: String) {
+fn draw_list_scrollbar(f: &mut Frame, app: &App) {
+    let list_area = app.list_area;
+    let (total, offset) = match app.tab {
+        Tab::Browse => (app.filtered.len(), app.browse_state.offset()),
+        Tab::Library => (app.lib_filtered.len(), app.lib_state.offset()),
+    };
+    let h = list_area.height as usize;
+    if h == 0 || total <= h {
+        return;
+    }
+    let max_offset = total - h;
+    let mut sb = ScrollbarState::new(max_offset + 1)
+        .position(offset.min(max_offset))
+        .viewport_content_length(h);
+    let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(Some("│"))
+        .thumb_symbol("┃")
+        .track_style(Style::new().fg(BORDER))
+        .thumb_style(Style::new().fg(ACCENT));
+    let sb_x = (list_area.x + list_area.width).min(f.area().right().saturating_sub(1));
+    let sb_area = Rect::new(sb_x, list_area.y, 1, list_area.height);
+    f.render_stateful_widget(bar, sb_area, &mut sb);
+}
+
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for word in text.split_whitespace() {
+        let mut chars: Vec<char> = word.chars().collect();
+        while chars.len() > width {
+            if cur_w > 0 {
+                lines.push(std::mem::take(&mut cur));
+                cur_w = 0;
+            }
+            let rest = chars.split_off(width);
+            lines.push(chars.iter().collect());
+            chars = rest;
+        }
+        let w = chars.len();
+        if cur_w == 0 {
+            cur = chars.iter().collect();
+            cur_w = w;
+        } else if cur_w + 1 + w <= width {
+            cur.push(' ');
+            cur.extend(chars.iter());
+            cur_w += 1 + w;
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            cur = chars.iter().collect();
+            cur_w = w;
+        }
+    }
+    if cur_w > 0 {
+        lines.push(cur);
+    }
+    lines
+}
+
+fn field(lines: &mut Vec<Line<'static>>, label: &str, value: &str, width: usize) {
     lines.push(Line::from(Span::styled(
         label.to_string(),
         Style::new().fg(DIM),
     )));
-    lines.push(Line::from(Span::styled(value, Style::new().fg(TEXT))));
+    for l in wrap(value, width) {
+        lines.push(Line::from(Span::styled(l, Style::new().fg(TEXT))));
+    }
     lines.push(Line::raw(""));
 }
 
-fn draw_details(f: &mut Frame, app: &App, area: Rect) {
+fn build_details(app: &App, width: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    let Some(game) = app.current_game() else {
+        lines.push(Line::from(Span::styled(
+            "Select a game to see details.",
+            Style::new().fg(DIM),
+        )));
+        return lines;
+    };
+
+    for l in wrap(&game.name, width) {
+        lines.push(Line::from(Span::styled(
+            l,
+            Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    let running = app.is_running(&game.app_id, &game.exe);
+    let in_library = app
+        .library
+        .iter()
+        .any(|l| l.app_id == game.app_id && l.exe == game.exe);
+
+    let mut badges: Vec<Span<'static>> = Vec::new();
+    if running {
+        badges.push(Span::styled("● running", Style::new().fg(GREEN)));
+    } else {
+        badges.push(Span::styled("○ stopped", Style::new().fg(DIM)));
+    }
+    if game.is_favorite {
+        badges.push(Span::styled("   ★ favorite", Style::new().fg(YELLOW)));
+    } else if in_library {
+        badges.push(Span::styled("   ✓ in library", Style::new().fg(ACCENT)));
+    }
+    lines.push(Line::from(badges));
+    lines.push(Line::raw(""));
+
+    field(&mut lines, "App ID", &game.app_id, width);
+    field(&mut lines, "Executable", &game.exe, width);
+
+    if let Some(db) = app.selected_db().filter(|_| app.tab == Tab::Browse) {
+        if db.uses_new_detection {
+            let note = format!(
+                "Discord lists no {} executable for this game, so the name is a guess and it may not be detected.",
+                app.os
+            );
+            for l in wrap(&note, width) {
+                lines.push(Line::from(Span::styled(l, Style::new().fg(YELLOW))));
+            }
+            lines.push(Line::raw(""));
+        }
+    }
+
+    if let Ok(p) = launcher::fake_exe_path(&game, &app.paths) {
+        let shown = p
+            .strip_prefix(&app.paths.dir)
+            .unwrap_or(p.as_path())
+            .display()
+            .to_string();
+        lines.push(Line::from(vec![
+            Span::styled("Dummy file", Style::new().fg(DIM)),
+            Span::styled(" · ", Style::new().fg(DIM)),
+            Span::styled("Ctrl+O", Style::new().fg(ACCENT)),
+            Span::styled(" open folder", Style::new().fg(DIM)),
+        ]));
+        for l in wrap(&shown, width) {
+            lines.push(Line::from(Span::styled(l, Style::new().fg(TEXT))));
+        }
+        if !p.exists() {
+            lines.push(Line::from(Span::styled(
+                "(created on first launch)",
+                Style::new().fg(DIM),
+            )));
+        }
+        lines.push(Line::raw(""));
+    }
+
+    lines
+}
+
+fn draw_details(f: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::new()
         .borders(Borders::LEFT)
         .border_style(Style::new().fg(BORDER))
         .padding(Padding::new(2, 0, 0, 0));
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    let inner = block.inner(area);
+    app.details_area = area;
 
-    match app.current_game() {
-        None => {
-            lines.push(Line::from(Span::styled(
-                "Select a game to see details.",
-                Style::new().fg(DIM),
-            )));
-        }
-        Some(game) => {
-            lines.push(Line::from(Span::styled(
-                game.name.clone(),
-                Style::new().fg(TEXT).add_modifier(Modifier::BOLD),
-            )));
-
-            let running = app.is_running(&game.app_id, &game.exe);
-            let in_library = app
-                .library
-                .iter()
-                .any(|l| l.app_id == game.app_id && l.exe == game.exe);
-
-            let mut badges: Vec<Span<'static>> = Vec::new();
-            if running {
-                badges.push(Span::styled("● running", Style::new().fg(GREEN)));
-            } else {
-                badges.push(Span::styled("○ stopped", Style::new().fg(DIM)));
-            }
-            if game.is_favorite {
-                badges.push(Span::styled("   ★ favorite", Style::new().fg(YELLOW)));
-            } else if in_library {
-                badges.push(Span::styled("   ✓ in library", Style::new().fg(ACCENT)));
-            }
-            lines.push(Line::from(badges));
-            lines.push(Line::raw(""));
-
-            field(&mut lines, "App ID", game.app_id.clone());
-            field(&mut lines, "Executable", game.exe.clone());
-
-            if let Some(db) = app.selected_db().filter(|_| app.tab == Tab::Browse) {
-                if db.uses_new_detection {
-                    lines.push(Line::from(Span::styled(
-                        format!(
-                            "Discord lists no {} executable for this game, so the name is a guess and it may not be detected.",
-                            app.os
-                        ),
-                        Style::new().fg(YELLOW),
-                    )));
-                    lines.push(Line::raw(""));
-                }
-            }
-
-            if let Ok(p) = launcher::fake_exe_path(&game, &app.paths) {
-                let state = if p.exists() {
-                    ""
-                } else {
-                    " (created on first launch)"
-                };
-                let shown = p
-                    .strip_prefix(&app.paths.dir)
-                    .unwrap_or(p.as_path())
-                    .display()
-                    .to_string();
-                lines.push(Line::from(vec![
-                    Span::styled("Dummy file", Style::new().fg(DIM)),
-                    Span::styled(" · ", Style::new().fg(DIM)),
-                    Span::styled("Ctrl+O", Style::new().fg(ACCENT)),
-                    Span::styled(" open folder", Style::new().fg(DIM)),
-                ]));
-                lines.push(Line::from(vec![
-                    Span::styled(shown, Style::new().fg(TEXT)),
-                    Span::styled(state, Style::new().fg(DIM)),
-                ]));
-                lines.push(Line::raw(""));
-            }
-        }
+    let key = format!(
+        "{}|{}",
+        matches!(app.tab, Tab::Library),
+        app.current_game().map(|g| g.key()).unwrap_or_default()
+    );
+    if key != app.detail_key {
+        app.detail_key = key;
+        app.detail_scroll = 0;
     }
 
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    let width = (inner.width as usize).saturating_sub(1);
+    let height = inner.height as usize;
+
+    let lines = build_details(app, width);
+    let max_scroll = lines.len().saturating_sub(height);
+    app.detail_scroll = app.detail_scroll.min(max_scroll);
+    let start = app.detail_scroll;
+    let visible: Vec<Line<'static>> = lines.into_iter().skip(start).take(height).collect();
+
+    f.render_widget(block, area);
+    f.render_widget(Paragraph::new(visible), inner);
+
+    if inner.width > 0 && inner.height > 0 {
+        let arrow = |text: &'static str, y: u16| {
+            (
+                Paragraph::new(Line::from(Span::styled(text, Style::new().fg(ACCENT))))
+                    .alignment(Alignment::Right),
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
+            )
+        };
+        if start > 0 {
+            let (w, r) = arrow("↑", inner.y);
+            f.render_widget(w, r);
+        }
+        if start < max_scroll {
+            let (w, r) = arrow("↓", inner.y + inner.height - 1);
+            f.render_widget(w, r);
+        }
+    }
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {

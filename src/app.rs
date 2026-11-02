@@ -2,8 +2,12 @@ use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
+use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 
 use crate::keys;
@@ -23,6 +27,8 @@ pub enum StatusKind {
     Busy,
     Error,
 }
+
+const STATUS_TTL: Duration = Duration::from_secs(15);
 
 pub struct App {
     pub tab: Tab,
@@ -46,8 +52,16 @@ pub struct App {
     pub running: HashMap<String, Child>,
     pub status: String,
     pub status_kind: StatusKind,
+    status_until: Option<Instant>,
     pub syncing: bool,
     pub should_quit: bool,
+
+    pub list_area: Rect,
+    pub details_area: Rect,
+    pub detail_scroll: usize,
+    pub detail_key: String,
+    pub tabs_y: u16,
+    pub tab_hits: Vec<(u16, u16, Tab)>,
 
     sync_rx: Option<Receiver<Result<bool, String>>>,
 }
@@ -73,8 +87,15 @@ impl App {
             running: HashMap::new(),
             status: String::new(),
             status_kind: StatusKind::Info,
+            status_until: None,
             syncing: false,
             should_quit: false,
+            list_area: Rect::default(),
+            details_area: Rect::default(),
+            detail_scroll: 0,
+            detail_key: String::new(),
+            tabs_y: 0,
+            tab_hits: Vec::new(),
             sync_rx: None,
         };
 
@@ -88,16 +109,27 @@ impl App {
     fn info(&mut self, msg: impl Into<String>) {
         self.status = msg.into();
         self.status_kind = StatusKind::Info;
+        self.status_until = None;
     }
 
     fn busy(&mut self, msg: impl Into<String>) {
         self.status = msg.into();
         self.status_kind = StatusKind::Busy;
+        self.status_until = None;
     }
 
     fn error(&mut self, msg: impl Into<String>) {
         self.status = msg.into();
         self.status_kind = StatusKind::Error;
+        self.status_until = Some(Instant::now() + STATUS_TTL);
+    }
+
+    fn expire_status(&mut self) {
+        if self.status_until.is_some_and(|t| Instant::now() >= t) {
+            self.status.clear();
+            self.status_kind = StatusKind::Info;
+            self.status_until = None;
+        }
     }
 
     fn reload_db(&mut self) -> Result<(), String> {
@@ -201,6 +233,7 @@ impl App {
             Some(Err(TryRecvError::Empty)) | None => {}
         }
         self.reap();
+        self.expire_status();
     }
 
     fn reap(&mut self) {
@@ -417,6 +450,63 @@ impl App {
         }
     }
 
+    fn scroll_details(&mut self, up: bool) {
+        self.detail_scroll = if up {
+            self.detail_scroll.saturating_sub(1)
+        } else {
+            self.detail_scroll + 1
+        };
+    }
+
+    fn list_len(&self) -> usize {
+        match self.tab {
+            Tab::Browse => self.filtered.len(),
+            Tab::Library => self.lib_filtered.len(),
+        }
+    }
+
+    pub fn handle_mouse(&mut self, m: MouseEvent) {
+        let inside = |a: Rect| {
+            m.column >= a.x && m.column < a.x + a.width && m.row >= a.y && m.row < a.y + a.height
+        };
+        match m.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let up = m.kind == MouseEventKind::ScrollUp;
+                if inside(self.details_area) {
+                    self.scroll_details(up);
+                } else {
+                    self.move_selection(if up { -1 } else { 1 });
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if m.row == self.tabs_y {
+                    if let Some(&(_, _, tab)) = self
+                        .tab_hits
+                        .iter()
+                        .find(|&&(x0, x1, _)| m.column >= x0 && m.column < x1)
+                    {
+                        self.tab = tab;
+                    }
+                    return;
+                }
+                if inside(self.list_area) {
+                    let state = match self.tab {
+                        Tab::Browse => &mut self.browse_state,
+                        Tab::Library => &mut self.lib_state,
+                    };
+                    let idx = state.offset() + (m.row - self.list_area.y) as usize;
+                    if idx < self.list_len() {
+                        match self.tab {
+                            Tab::Browse => self.browse_state.select(Some(idx)),
+                            Tab::Library => self.lib_state.select(Some(idx)),
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL) || keys::ctrl_held();
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -452,6 +542,8 @@ impl App {
                     Tab::Library => Tab::Browse,
                 };
             }
+            KeyCode::Up if alt => self.scroll_details(true),
+            KeyCode::Down if alt => self.scroll_details(false),
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
             KeyCode::PageUp => self.move_selection(-10),
