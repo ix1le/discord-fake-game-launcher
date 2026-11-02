@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::model::{DetectableApp, Game};
 
 const DETECTABLE_URL: &str = "https://discord.com/api/applications/detectable";
-const USER_AGENT: &str = "DiscordFakeGameLauncherTUI/0.1.0";
+const USER_AGENT: &str = "Mozilla/5.0";
 
 #[derive(Debug, Clone)]
 pub struct Paths {
